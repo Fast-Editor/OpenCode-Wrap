@@ -14,9 +14,11 @@ reuses whatever auth the `opencode` CLI already has.
 ## Run
 
 ```bash
+npx opencode-wrap
+# or globally: npm i -g opencode-wrap && opencode-wrap
+# or from source:
 cd ~/opencode-wrap
 npm start
-# or: WRAP_PORT=8000 node server.js
 # -> OpenAI-compatible API at http://127.0.0.1:8000/v1
 ```
 
@@ -43,6 +45,10 @@ Run `npm test` for the smoke tests (`node --test`).
 - `GET /v1/models`
 - `POST /v1/chat/completions` — `model`, `messages`, `tools`, `tool_choice`
   (`none`/`auto`/`required`/`{function:{name}}`), `stream` all supported.
+  `stream:true` is true streaming: backend `message.part.delta` events are
+  forwarded as OpenAI chunks the moment they arrive (falls back to buffered
+  replay if the event bus is unreachable; mid-stream backend failures are
+  delivered in-band as an `error` chunk since headers are already sent).
 
 ## Examples
 

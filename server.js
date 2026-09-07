@@ -386,8 +386,10 @@ function parseToolCalls(text, knownNames) {
 
 const rid = (p) => `${p}_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
 
-async function handleChatCompletions(body, opts = {}) {
-  const signal = opts.signal;
+// Shared first half of a turn: model resolution + prompt rendering.
+// Used by both buffered and streaming paths (streaming must run this
+// BEFORE sending SSE headers so ValidationErrors still map to clean 400s).
+async function prepareTurn(body) {
   const rawReq = String(body.model || `${DEFAULT_PROVIDER}/${DEFAULT_MODEL}`).trim();
   const explicit = rawReq.includes("/");
   const [prov, ...rest] = explicit ? rawReq.split("/") : [DEFAULT_PROVIDER, rawReq];
@@ -429,6 +431,13 @@ async function handleChatCompletions(body, opts = {}) {
 
   const reqBody = { model, agent: "build", parts: [{ type: "text", text: promptText }] };
   if (systemText) reqBody.system = systemText;
+  const modelName = body.model || `${model.providerID}/${model.modelID}`;
+  return { model, modelName, reqBody, tools, toolChoice, knownNames };
+}
+
+async function handleChatCompletions(body, opts = {}) {
+  const signal = opts.signal;
+  const { model, modelName, reqBody, knownNames } = await prepareTurn(body);
   // promptWithRetry owns session lifecycle (fresh session per attempt).
   // Also retry empty completions (upstream sometimes returns contentless
   // stop turns; callers read those as "done" and stall mid-task).
@@ -474,7 +483,7 @@ async function handleChatCompletions(body, opts = {}) {
 
   if (calls.length) {
     return {
-      id, object: "chat.completion", created, model: body.model || `${model.providerID}/${model.modelID}`,
+      id, object: "chat.completion", created, model: modelName,
       choices: [{
         index: 0,
         message: {
@@ -488,7 +497,7 @@ async function handleChatCompletions(body, opts = {}) {
     };
   }
   return {
-    id, object: "chat.completion", created, model: body.model || `${model.providerID}/${model.modelID}`,
+    id, object: "chat.completion", created, model: modelName,
     choices: [{ index: 0, message: { role: "assistant", content: content || text || "" }, finish_reason: "stop" }],
     usage,
   };
@@ -497,24 +506,159 @@ async function handleChatCompletions(body, opts = {}) {
   }
 }
 
-function writeSSE(res, completion, streamModel) {
-  const base = { id: completion.id, object: "chat.completion.chunk", created: completion.created, model: streamModel };
-  const send = (delta, finish = null) => res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
-  const msg = completion.choices[0].message;
-  send({ role: "assistant", content: "" });
-  if (msg.content) {
-    // keep chunks small-ish
-    const s = msg.content;
-    for (let i = 0; i < s.length; i += 500) send({ content: s.slice(i, i + 500) });
+// ---------- True streaming via the backend event bus ----------
+// `POST /session/:id/message` is buffered server-side, but every backend
+// also broadcasts live `message.part.delta` events on `GET /event`
+// ({ properties: { sessionID, field: "text", delta } }).
+// For stream=true we subscribe first, then POST, and forward text deltas
+// as OpenAI chunks the moment they arrive.
+
+function parseEventBlock(block) {
+  const out = [];
+  for (const line of String(block).split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try { out.push(JSON.parse(payload)); } catch { /* heartbeat / partial */ }
   }
-  if (msg.tool_calls) {
-    msg.tool_calls.forEach((tc, i) => send({ tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }));
-    send({}, "tool_calls");
-  } else {
-    send({}, "stop");
+  return out;
+}
+
+// Opens GET /event and forwards parsed events to onEvent.
+// Resolves with { close } once subscribed (headers received); the reader
+// loop runs in the background until close() or signal abort.
+async function subscribeOcoEvents(onEvent, opts = {}) {
+  const signal = opts.signal;
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new ClientAbortError();
+  const res = await fetch(`${OPENCODE_BASE}/event`, {
+    headers: { Accept: "text/event-stream" },
+    signal: signal || undefined,
+  });
+  if (!res.ok || !res.body) throw new UpstreamError(res.status || 502, "event stream unavailable");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let closed = false;
+  const close = () => { closed = true; try { reader.cancel(); } catch { /* ignore */ } };
+  (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const ev of parseEventBlock(block)) {
+            if (closed) break;
+            try { onEvent(ev); } catch { /* ignore listener errors */ }
+          }
+        }
+        if (closed) break;
+      }
+    } catch { /* aborted or upstream hung up */ }
+  })();
+  return { close };
+}
+
+function sseSend(res, base, delta, finish = null) {
+  res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
+}
+
+function sseErrorAndEnd(res, base, message) {
+  try { res.write(`data: ${JSON.stringify({ ...base, error: { message } })}\n\n`); } catch { /* ignore */ }
+  try { res.end(); } catch { /* ignore */ }
+}
+
+async function streamChatCompletions(body, res, opts = {}) {
+  const signal = opts.signal;
+  // Before headers: ValidationErrors still map to clean HTTP 400s upstream.
+  const { modelName, reqBody, knownNames } = await prepareTurn(body);
+  const id = rid("chatcmpl");
+  const created = Math.floor(Date.now() / 1000);
+  const base = { id, object: "chat.completion.chunk", created, model: modelName };
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  sseSend(res, base, { role: "assistant", content: "" });
+
+  // Retry only while nothing has been streamed yet — after the first delta
+  // the client owns partial output and a fresh session can't take it back.
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new ClientAbortError();
+    const session = await oco("/session", "POST", {}, { signal });
+    const sid = session.id;
+    let streamedText = "";
+    let subDone = false;
+    let sub = null;
+    try {
+      try {
+        sub = await subscribeOcoEvents((ev) => {
+          if (subDone || ev?.type !== "message.part.delta") return;
+          const p = ev.properties || {};
+          if (p.sessionID !== sid || p.field !== "text" || typeof p.delta !== "string" || !p.delta) return;
+          streamedText += p.delta;
+          sseSend(res, base, { content: p.delta });
+        }, { signal });
+      } catch (e) {
+        console.error(`[wrap] event subscription failed, falling back to buffered replay (${e.message})`);
+      }
+      const resp = await oco(`/session/${sid}/message`, "POST", reqBody, { signal });
+      subDone = true;
+      try { sub?.close(); } catch { /* ignore */ }
+      let text = (resp.parts || []).filter((p) => p.type === "text").map((p) => p.text || "").join("");
+      let finish = resp.info?.finish || "stop";
+      if (!text || finish === "tool-calls") {
+        const all = await oco(`/session/${sid}/message?limit=20`, "GET", undefined, { signal });
+        const texts = [];
+        for (const m of all) {
+          if (m.info?.role === "assistant") for (const p of m.parts || []) if (p.type === "text" && p.text) texts.push(p.text);
+        }
+        if (texts.length) text = texts[texts.length - 1];
+      }
+      if (!text) throw new UpstreamError(502, "empty completion");
+      // Tail: deltas normally concatenate to the final text; forward anything
+      // the subscription missed (or everything if it never connected).
+      if (text.length > streamedText.length && text.startsWith(streamedText)) {
+        const tail = text.slice(streamedText.length);
+        for (let i = 0; i < tail.length; i += 500) sseSend(res, base, { content: tail.slice(i, i + 500) });
+      }
+      const { content, calls } = parseToolCalls(text, knownNames.size ? knownNames : null);
+      if (calls.length) {
+        // Caller tools were fenced inside the text; surface them as deltas.
+        // (content outside the fences was already streamed verbatim.)
+        calls.forEach((c, i) => sseSend(res, base, { tool_calls: [{ index: i, id: rid("call"), type: "function", function: { name: c.name, arguments: JSON.stringify(c.args) } }] }));
+        sseSend(res, base, {}, "tool_calls");
+      } else {
+        void content;
+        sseSend(res, base, {}, "stop");
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    } catch (e) {
+      lastErr = e;
+      subDone = true;
+      try { sub?.close(); } catch { /* ignore */ }
+      try { await oco(`/session/${sid}`, "DELETE", undefined, { timeoutMs: 15000 }); } catch { /* best-effort */ }
+      if (e instanceof ClientAbortError || signal?.aborted) throw e;
+      const detail = e instanceof UpstreamError ? `upstream ${e.upstreamStatus}: ${(e.upstreamBody || "").slice(0, 200)}` : `${e.name || "Error"}: ${e.message}`;
+      console.error(`[wrap] stream attempt ${attempt}/3 failed: ${detail}`);
+      if (streamedText.length > 0 || !isRetryableUpstream(e) || attempt === 3) {
+        // Headers are already sent: surface the failure in-band so the
+        // client doesn't read a truncated turn as complete.
+        sseErrorAndEnd(res, base, e instanceof UpstreamError ? `Upstream model backend failed: ${(e.upstreamBody || "").slice(0, 200)}` : e.message);
+        try { await oco(`/session/${sid}`, "DELETE", undefined, { timeoutMs: 15000 }); } catch { /* ignore */ }
+        return;
+      }
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, isRateLimitedUpstream(e) ? 4000 : 1500 * attempt);
+        if (signal) signal.addEventListener("abort", () => { clearTimeout(t); reject(signal.reason instanceof Error ? signal.reason : new ClientAbortError()); }, { once: true });
+      });
+    }
   }
-  res.write("data: [DONE]\n\n");
-  res.end();
+  throw lastErr;
 }
 
 // ---------- HTTP server ----------
@@ -549,12 +693,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       const body = await readBody(req, { signal: clientCtrl.signal });
       console.log(`[wrap] chat: model=${JSON.stringify(body.model)} msgs=${(body.messages || []).length} tools=${(body.tools || []).length} stream=${!!body.stream}`);
-      const completion = await handleChatCompletions(body, { signal: clientCtrl.signal });
-      if (clientCtrl.signal.aborted) return; // caller gone — session already cleaned up
       if (body.stream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-        writeSSE(res, completion, body.model || `${DEFAULT_PROVIDER}/${DEFAULT_MODEL}`);
+        // True streaming: backend text deltas are forwarded live. Errors
+        // after the first byte are delivered in-band (headers already sent).
+        await streamChatCompletions(body, res, { signal: clientCtrl.signal });
       } else {
+        const completion = await handleChatCompletions(body, { signal: clientCtrl.signal });
+        if (clientCtrl.signal.aborted) return; // caller gone — session already cleaned up
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(completion));
       }
@@ -607,14 +752,19 @@ function shutdown(sig) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-if (require.main === module) {
+function start() {
   requireOpencodeInstalled();
-  ensureOpencode().then(() => server.listen(PORT, () => console.log(`[wrap] OpenAI-compatible API at http://127.0.0.1:${PORT}/v1`)))
+  return ensureOpencode().then(() => server.listen(PORT, () => console.log(`[wrap] OpenAI-compatible API at http://127.0.0.1:${PORT}/v1`)))
     .catch((e) => { console.error("[wrap] failed to start:", e.message); process.exit(1); });
 }
 
+if (require.main === module) {
+  start();
+}
+
 module.exports = {
-  server, ensureOpencode, handleChatCompletions,
+  server, start, ensureOpencode, handleChatCompletions, streamChatCompletions, prepareTurn,
+  subscribeOcoEvents, parseEventBlock,
   resolveModelId, zenModelIds, oco, promptWithRetry,
   readBody, msgText, renderHistory, toolInstruction, parseToolCalls,
   isTimeoutAbort, isTransientConnectionError, isRetryableUpstream, isRateLimitedUpstream,

@@ -1,15 +1,31 @@
 {
   "name": "opencode-wrap",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenAI-compatible API in front of `opencode serve`",
   "main": "server.js",
+  "bin": {
+    "opencode-wrap": "bin/opencode-wrap.js"
+  },
+  "files": [
+    "server.js",
+    "bin/",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "openai",
+    "openai-compatible",
+    "llm",
+    "proxy",
+    "sse"
+  ],
   "type": "commonjs",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/smoke.test.js",
+    "test": "node --test test/smoke.test.js test/stream.test.js",
     "check": "node --check server.js"
   },
   "license": "MIT"
