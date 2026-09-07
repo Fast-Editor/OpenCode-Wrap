@@ -1,0 +1,16 @@
+{
+  "name": "opencode-wrap",
+  "version": "0.2.0",
+  "description": "OpenAI-compatible API in front of `opencode serve`",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/smoke.test.js",
+    "check": "node --check server.js"
+  },
+  "license": "MIT"
+}
