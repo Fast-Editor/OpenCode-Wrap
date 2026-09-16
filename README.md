@@ -52,6 +52,26 @@ Run `npm test` for the smoke tests (`node --test`).
 
 ## Examples
 
+### Union Alpha
+
+Select Union Alpha with the model ID `opencode/union-alpha`. No auth header
+is needed for the local wrapper; this does not change the default backend model.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"opencode/union-alpha",
+       "messages":[{"role":"user","content":"say hi"}]}'
+```
+
+List available models:
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+### Default model and tools
+
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
