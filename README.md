@@ -89,7 +89,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 # -> finish_reason tool_calls, then send back role:tool result for final answer
 ```
 
-Point Lynkr at it as a generic OpenAI endpoint (`http://127.0.0.1:8000/v1`).
+
 
 ## Notes
 
@@ -102,19 +102,6 @@ Point Lynkr at it as a generic OpenAI endpoint (`http://127.0.0.1:8000/v1`).
   `wrap/muse-spark-free`) falls back to the backend model with a log line.
 - Empty contentless turns are retried (fresh session), not served as `stop`.
 
-## Skipping Lynkr for chores (fix #3)
-
-`~/.config/opencode/opencode.jsonc` defines a direct `wrap` provider
-(`http://127.0.0.1:8000/v1`) and sets it as `small_model`, so session titles
-and compaction go straight to the free backend instead of through Lynkr
-routing. Main model stays as selected in TUI (`lynkr/lynkr-auto`).
-- Caller tools are translated via instruction + `tool_call` fence parsing
-  (`opencode serve` has no custom-tool passthrough), then returned as
-  OpenAI `tool_calls`. Under `tool_choice:auto` the model sometimes answers
-  from knowledge instead of calling — use `required` (or a named tool) to force.
-- Transient backend 500s (free-tier flakes) are retried 3x with fresh
-  sessions + backoff; persistent failures surface as OpenAI-shaped
-  `429` (rate-limited) / `502` (bad gateway) so callers can retry/cascade.
 
 ## Fair use
 
