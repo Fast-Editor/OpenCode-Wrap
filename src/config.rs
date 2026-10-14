@@ -39,7 +39,16 @@ impl Config {
             default_model: env::var("WRAP_MODEL")
                 .unwrap_or_else(|_| "muse-spark-1.3-contributor-free".into()),
             default_provider: env::var("WRAP_PROVIDER").unwrap_or_else(|_| "opencode".into()),
-            wrap_cwd: env::var("WRAP_CWD").unwrap_or_else(|_| "/tmp".into()),
+            wrap_cwd: env::var("WRAP_CWD").unwrap_or_else(|_| {
+                #[cfg(windows)]
+                {
+                    env::var("TEMP").unwrap_or_else(|_| "C:\\temp".into())
+                }
+                #[cfg(not(windows))]
+                {
+                    "/tmp".into()
+                }
+            }),
             oco_timeout_ms: num_env("WRAP_OCO_TIMEOUT_MS", 180_000, 100, 1_800_000)?,
             wrap_max_body_bytes: num_env(
                 "WRAP_MAX_BODY_BYTES",
