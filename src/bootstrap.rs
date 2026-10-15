@@ -14,6 +14,42 @@ const SPAWN_READY_SECS: u64 = 20;
 /// The wrapper speaks the OpenCode 2 `/api/*` contract only.
 pub const MIN_OPENCODE_MAJOR: u64 = 2;
 
+/// Program name to launch the OpenCode CLI with.
+///
+/// On Windows, `Command` does not consult `PATHEXT`, and npm installs expose
+/// OpenCode as an `opencode.cmd` shim rather than an `.exe`, so probe `PATH`
+/// for the concrete file. Rust's `Command` runs `.cmd`/`.bat` through
+/// `cmd.exe` itself, so returning the shim's file name is enough.
+fn opencode_program() -> String {
+    if cfg!(windows) {
+        if let Some(found) = find_on_path(
+            &["opencode.exe", "opencode.cmd", "opencode.bat"],
+            std::env::var_os("PATH").as_deref(),
+        ) {
+            return found;
+        }
+    }
+    "opencode".into()
+}
+
+/// First of `candidates` that exists as a file in any `PATH` entry.
+pub(crate) fn find_on_path(candidates: &[&str], path: Option<&std::ffi::OsStr>) -> Option<String> {
+    let path = path?;
+    for dir in std::env::split_paths(path) {
+        for name in candidates {
+            if dir.join(name).is_file() {
+                return Some((*name).to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_batch_shim(program: &str) -> bool {
+    let lower = program.to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
 pub struct SpawnState {
     pub child: Option<Child>,
     pub spawned: Arc<AtomicBool>,
@@ -118,7 +154,13 @@ pub async fn ensure_opencode(client: &OcoClient, spawn: &mut SpawnState) -> Resu
         client.config.wrap_cwd
     );
     let (stdout, stderr) = serve_log_stdio(&client.config.wrap_cwd)?;
-    let child = Command::new("opencode")
+    let program = opencode_program();
+    if is_batch_shim(&program) {
+        tracing::warn!(
+            "[wrap] opencode resolved to the {program} shim; the spawned server may outlive this process because only the shim is killed on shutdown. Prefer a native opencode.exe install."
+        );
+    }
+    let child = Command::new(&program)
         .args([
             "serve",
             "--port",
@@ -185,7 +227,7 @@ pub(crate) fn parse_major_version(text: &str) -> Option<u64> {
 }
 
 pub fn require_opencode_installed() -> Result<(), String> {
-    let out = std::process::Command::new("opencode")
+    let out = std::process::Command::new(opencode_program())
         .arg("--version")
         .stderr(Stdio::null())
         .output();
@@ -221,6 +263,27 @@ pub fn require_opencode_installed() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_on_path_picks_first_existing_candidate() {
+        let dir = std::env::temp_dir().join(format!("ocw-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.cmd"), "@echo off").unwrap();
+        let path =
+            std::env::join_paths([std::path::Path::new("/nonexistent"), dir.as_path()]).unwrap();
+        assert_eq!(
+            find_on_path(&["opencode.exe", "opencode.cmd"], Some(path.as_os_str())),
+            Some("opencode.cmd".into())
+        );
+        assert_eq!(
+            find_on_path(&["opencode.exe"], Some(path.as_os_str())),
+            None
+        );
+        assert_eq!(find_on_path(&["opencode.exe"], None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(is_batch_shim("opencode.CMD"));
+        assert!(!is_batch_shim("opencode.exe"));
+    }
 
     #[test]
     fn parses_major_version_from_cli_output() {

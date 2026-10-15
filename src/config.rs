@@ -43,8 +43,8 @@ impl Config {
                 "config_error",
             ));
         }
-        let wrap_cwd = require_dir(&env::var("WRAP_CWD").unwrap_or_else(|_| "/tmp".into()))?;
-        if let Ok(home) = env::var("HOME") {
+        let wrap_cwd = require_dir(&env::var("WRAP_CWD").unwrap_or_else(|_| default_wrap_cwd()))?;
+        if let Ok(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
             if paths_equal(&wrap_cwd, &home) {
                 tracing::warn!(
                     "[wrap] WRAP_CWD is the home directory; opencode tools run there. Point WRAP_CWD at an empty sandbox directory."
@@ -105,6 +105,16 @@ impl Config {
             cors_origins: Vec::new(),
             max_in_flight: 8,
         }
+    }
+}
+
+/// `/tmp` on Unix; the user's temp directory (`%TEMP%`, always present) on
+/// Windows, where `/tmp` does not exist and would fail `require_dir`.
+fn default_wrap_cwd() -> String {
+    if cfg!(windows) {
+        env::temp_dir().to_string_lossy().into_owned()
+    } else {
+        "/tmp".into()
     }
 }
 
@@ -229,6 +239,12 @@ mod tests {
             parse_cors_origins_from(Some("https://a.example, https://b.example")),
             vec!["https://a.example", "https://b.example"]
         );
+    }
+
+    #[test]
+    fn default_wrap_cwd_exists() {
+        let d = default_wrap_cwd();
+        assert!(std::path::Path::new(&d).is_dir(), "{d} should exist");
     }
 
     #[test]
