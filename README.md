@@ -143,7 +143,8 @@ message projection and event filtering. CI also runs `cargo fmt --check` and
 
 ## Endpoints
 
-- `GET /health`, `/v1/health` — liveness probe
+- `GET /health`, `/v1/health` — liveness probe; reports the wrapper `version`
+  so you can tell which build is running (`opencode-wrap --version` too)
 - `GET /v1/models` — default backend first, then full Zen list (`opencode/<id>`)
 - `POST /v1/chat/completions` — `model`, `messages`, `tools`, `tool_choice`
   (`none` / `auto` / `required` / `{"type":"function","function":{"name"}}`),

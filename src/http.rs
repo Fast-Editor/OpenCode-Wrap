@@ -48,6 +48,7 @@ fn build_cors(origins: &[String]) -> CorsLayer {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("[wrap] opencode-wrap v{}", env!("CARGO_PKG_VERSION"));
     let config = Config::from_env().map_err(|e| e.to_string())?;
     require_opencode_installed().map_err(|e| e.to_string())?;
     let client = OcoClient::new(config.clone());
@@ -195,6 +196,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<JsonValue> {
     let spawned = state.spawn.lock().await.spawned.load(Ordering::SeqCst);
     Json(json!({
         "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
         "upstream": state.client.config.opencode_base,
         "spawned": spawned
     }))
