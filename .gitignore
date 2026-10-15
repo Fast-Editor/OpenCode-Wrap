@@ -1,1 +1,4 @@
 /target/
+*.log
+.env
+dist/

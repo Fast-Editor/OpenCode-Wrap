@@ -1,12 +1,74 @@
+use std::sync::OnceLock;
+
 use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::error::ValidationError;
 
+const HISTORY_CHAR_BUDGET: usize = 200_000;
+pub(crate) const MAX_FILE_URL_BYTES: usize = 4 * 1024 * 1024;
+
+fn alias_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(muse-spark-.+-contributor)$").expect("alias regex"))
+}
+
+fn data_url_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^data:([^;,]+)?(;base64)?,").expect("data-url regex"))
+}
+
+fn tool_call_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"```tool_call\s*([\s\S]*?)```").expect("tool-call regex"))
+}
+
+/// Cut `s` to at most `max_bytes`, backing up to a UTF-8 boundary.
+pub(crate) fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> String {
+    if max_bytes >= s.len() {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn truncate_tail(s: &str, max_bytes: usize) -> String {
+    if max_bytes >= s.len() {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// Split `s` into pieces of about `size` bytes without cutting a codepoint.
+pub(crate) fn char_chunks(s: &str, size: usize) -> Vec<String> {
+    let size = size.max(1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let mut end = (i + size).min(s.len());
+        while end > i && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == i {
+            let width = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            end = (i + width).min(s.len());
+        }
+        out.push(s[i..end].to_string());
+        i = end;
+    }
+    out
+}
+
 pub fn resolve_model_id(raw: &str) -> String {
     let id = raw.trim();
-    let re = Regex::new(r"^(muse-spark-.+-contributor)$").unwrap();
-    if re.is_match(id) && !id.ends_with("-free") {
+    if alias_re().is_match(id) && !id.ends_with("-free") {
         tracing::info!(
             "[wrap] aliasing unknown model \"{}\" -> \"{}-free\"",
             id,
@@ -52,10 +114,7 @@ pub fn msg_text(m: &Value) -> String {
 
 pub fn guess_mime(url: &str) -> String {
     let u = url;
-    if let Some(m) = Regex::new(r"^data:([^;,]+)?(;base64)?,")
-        .unwrap()
-        .captures(u)
-    {
+    if let Some(m) = data_url_re().captures(u) {
         if let Some(mime) = m.get(1) {
             return mime.as_str().to_lowercase();
         }
@@ -86,10 +145,21 @@ pub fn guess_mime(url: &str) -> String {
     if clean.ends_with(".mp4") {
         return "video/mp4".into();
     }
-    "image/png".into()
+    "application/octet-stream".into()
 }
 
-pub fn collect_file_parts(messages: &[Value]) -> Vec<Value> {
+fn ensure_file_url_size(url: &str) -> Result<(), ValidationError> {
+    if url.len() > MAX_FILE_URL_BYTES {
+        return Err(ValidationError::new(
+            format!("file attachment exceeds {MAX_FILE_URL_BYTES} bytes"),
+            400,
+            "invalid_request_error",
+        ));
+    }
+    Ok(())
+}
+
+pub fn collect_file_parts(messages: &[Value]) -> Result<Vec<Value>, ValidationError> {
     let mut out = Vec::new();
     for m in messages {
         let c = m.get("content");
@@ -100,17 +170,18 @@ pub fn collect_file_parts(messages: &[Value]) -> Vec<Value> {
             if !p.is_object() {
                 continue;
             }
-            let url = file_part_url(p);
-            if let Some(url) = url {
-                out.push(json!({
-                    "type": "file",
-                    "mime": guess_mime(&url),
-                    "url": url
-                }));
-            }
+            let Some(url) = file_part_url(p) else {
+                continue;
+            };
+            ensure_file_url_size(&url)?;
+            out.push(json!({
+                "type": "file",
+                "mime": guess_mime(&url),
+                "url": url
+            }));
         }
     }
-    out
+    Ok(out)
 }
 
 fn file_part_url(p: &Value) -> Option<String> {
@@ -157,67 +228,103 @@ fn image_placeholder_count(m: &Value) -> usize {
         .count()
 }
 
-pub fn render_history(messages: &[Value]) -> String {
+fn render_message(m: &Value) -> Option<String> {
+    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role == "system" || role == "developer" {
+        return None;
+    }
+    let imgs = image_placeholder_count(m);
+    let suffix = if imgs > 0 {
+        format!("\n[attached {imgs} image/file part(s) — see message attachments]")
+    } else {
+        String::new()
+    };
     let mut out = Vec::new();
-    for m in messages {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        if role == "system" || role == "developer" {
-            continue;
+    if role == "tool" {
+        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        out.push(format!(
+            "TOOL RESULT (name={name} id={id}):\n{}{suffix}",
+            msg_text(m)
+        ));
+    } else if role == "assistant" && m.get("tool_calls").is_some() {
+        let text = msg_text(m);
+        if !text.is_empty() {
+            out.push(format!("ASSISTANT: {text}{suffix}"));
+        } else if !suffix.is_empty() {
+            out.push(format!("ASSISTANT: {}", suffix.trim()));
         }
-        let imgs = image_placeholder_count(m);
-        let suffix = if imgs > 0 {
-            format!(
-                "\n[attached {} image/file part(s) — see message attachments]",
-                imgs
-            )
-        } else {
-            String::new()
-        };
-        if role == "tool" {
-            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let id = m
-                .get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            out.push(format!(
-                "TOOL RESULT (name={} id={}):\n{}{}",
-                name,
-                id,
-                msg_text(m),
-                suffix
-            ));
-        } else if role == "assistant" && m.get("tool_calls").is_some() {
-            let text = msg_text(m);
-            if !text.is_empty() {
-                out.push(format!("ASSISTANT: {}{}", text, suffix));
-            } else if !suffix.is_empty() {
-                out.push(format!("ASSISTANT: {}", suffix.trim()));
-            }
-            let empty: Vec<Value> = Vec::new();
-            let calls = m.get("tool_calls").unwrap();
-            let mapped: Vec<Value> = calls
-                .as_array()
-                .unwrap_or(&empty)
-                .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.get("id"),
-                        "name": t.get("function").and_then(|f| f.get("name")),
-                        "arguments": t.get("function").and_then(|f| f.get("arguments"))
-                    })
+        let empty: Vec<Value> = Vec::new();
+        let calls = m.get("tool_calls").unwrap();
+        let mapped: Vec<Value> = calls
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.get("id"),
+                    "name": t.get("function").and_then(|f| f.get("name")),
+                    "arguments": t.get("function").and_then(|f| f.get("arguments"))
                 })
-                .collect();
-            out.push(format!(
-                "ASSISTANT TOOL CALLS: {}",
-                serde_json::to_string(&mapped).unwrap_or_default()
-            ));
-        } else {
-            let r = role.to_uppercase();
-            let r = if r.is_empty() { "USER".into() } else { r };
-            out.push(format!("{}: {}{}", r, msg_text(m), suffix));
+            })
+            .collect();
+        out.push(format!(
+            "ASSISTANT TOOL CALLS: {}",
+            serde_json::to_string(&mapped).unwrap_or_default()
+        ));
+    } else {
+        let r = role.to_uppercase();
+        let r = if r.is_empty() { "USER".into() } else { r };
+        out.push(format!("{r}: {}{suffix}", msg_text(m)));
+    }
+    Some(out.join("\n\n"))
+}
+
+fn join_history_tail(blocks: &[String], budget: usize) -> String {
+    if blocks.is_empty() {
+        return String::new();
+    }
+    let budget = budget.max(1);
+    let mut start = blocks.len();
+    let mut used = 0usize;
+    while start > 0 {
+        let block = &blocks[start - 1];
+        let sep = if start == blocks.len() { 0 } else { 2 };
+        let add = sep + block.len();
+        if used + add > budget && start != blocks.len() {
+            break;
+        }
+        if add > budget && start == blocks.len() {
+            let body = truncate_tail(block, budget);
+            if blocks.len() == 1 {
+                return body;
+            }
+            let omitted = blocks.len() - 1;
+            return format!("[earlier messages omitted: {omitted}]\n\n{body}");
+        }
+        used += add;
+        start -= 1;
+        if used >= budget {
+            break;
         }
     }
-    out.join("\n\n")
+    if start == 0 {
+        return blocks.join("\n\n");
+    }
+    let body = blocks[start..].join("\n\n");
+    format!("[earlier messages omitted: {start}]\n\n{body}")
+}
+
+pub fn render_history(messages: &[Value]) -> String {
+    render_history_with_budget(messages, HISTORY_CHAR_BUDGET)
+}
+
+fn render_history_with_budget(messages: &[Value], budget: usize) -> String {
+    let blocks: Vec<String> = messages.iter().filter_map(render_message).collect();
+    join_history_tail(&blocks, budget)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,11 +404,17 @@ pub fn parse_chat_options(body: &Value) -> Result<ChatOptions, ValidationError> 
                     "invalid_request_error",
                 ));
             }
+            if arr.len() > 4 {
+                return Err(ValidationError::new(
+                    "stop may contain at most 4 sequences",
+                    400,
+                    "invalid_request_error",
+                ));
+            }
             let v: Vec<String> = arr
                 .iter()
                 .filter_map(|s| s.as_str())
                 .filter(|s| !s.is_empty())
-                .take(4)
                 .map(|s| s.to_string())
                 .collect();
             if v.is_empty() {
@@ -374,23 +487,46 @@ fn check_num(v: Option<&Value>, name: &str, min: f64, max: f64) -> Result<(), Va
     }
 }
 
+pub(crate) fn tool_choice_function_name(tc: &Value) -> Option<&str> {
+    let nested = tc
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty());
+    if nested.is_some() {
+        return nested;
+    }
+    if tc.get("type").and_then(|t| t.as_str()) == Some("function") {
+        return tc
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty());
+    }
+    None
+}
+
 fn validate_tool_choice(tc: &Value) -> Result<(), ValidationError> {
     if let Some(s) = tc.as_str() {
-        if ["none", "auto", "required"].contains(&s) {
+        if matches!(s, "none" | "auto" | "required") {
             return Ok(());
         }
     }
     if tc.is_object() {
-        let name = tc
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str());
-        if name.is_some() {
+        if let Some(t) = tc.get("type").and_then(|v| v.as_str()) {
+            if t != "function" {
+                return Err(ValidationError::new(
+                    format!("unsupported tool_choice.type \"{t}\""),
+                    400,
+                    "invalid_request_error",
+                ));
+            }
+        }
+        if tool_choice_function_name(tc).is_some() {
             return Ok(());
         }
     }
     Err(ValidationError::new(
-        "tool_choice must be \"none\", \"auto\", \"required\", or {function:{name}}",
+        "tool_choice must be \"none\", \"auto\", \"required\", {\"type\":\"function\",\"function\":{\"name\":\"...\"}}, or {\"function\":{\"name\":\"...\"}}",
         400,
         "invalid_request_error",
     ))
@@ -413,15 +549,15 @@ pub fn apply_stop_and_max_tokens(text: &str, opts: &ChatOptions) -> TruncateResu
             }
         }
         if let Some(i) = cut {
-            out = out[..i].to_string();
+            out = truncate_to_char_boundary(&out, i);
             truncated_by = Some("stop".into());
         }
     }
     if let Some(max) = opts.max_tokens {
         if max > 0 {
-            let approx = (max * 4) as usize;
+            let approx = usize::try_from(max.saturating_mul(4)).unwrap_or(usize::MAX);
             if out.len() > approx {
-                out = out[..approx].to_string();
+                out = truncate_to_char_boundary(&out, approx);
                 truncated_by = Some("length".into());
             }
         }
@@ -456,11 +592,7 @@ pub fn tool_instruction(tools: &[Value], tool_choice: Option<&Value>) -> String 
         .collect();
     if let Some(obj) = tool_choice {
         if obj.is_object() {
-            let name = obj
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("?");
+            let name = tool_choice_function_name(obj).unwrap_or("?");
             return format!(
                 "You have access to these tools (OpenAI function format):\n{}\nRULES: You MUST call the tool named \"{}\" — reply with its tool call block. Do not answer in plain text.\nEach call is exactly one fenced block, nothing else inside the block:\n```tool_call\n{{\"name\":\"<tool name>\",\"arguments\":{{...}}}}\n```\nUse only the listed tool names. arguments must be a JSON object matching the tool's parameters schema. Put any explanation OUTSIDE the blocks.",
                 serde_json::to_string(&defs).unwrap_or_default(),
@@ -476,10 +608,10 @@ pub fn tool_instruction(tools: &[Value], tool_choice: Option<&Value>) -> String 
             "If the request needs a tool, reply with one or more tool call blocks. If no tool is needed, answer normally with no blocks."
         }
     };
-    vec![
+    [
         "You have access to these tools (OpenAI function format):".to_string(),
         serde_json::to_string(&defs).unwrap_or_default(),
-        format!("RULES: {}", rule),
+        format!("RULES: {rule}"),
         "Each call is exactly one fenced block, nothing else inside the block:".to_string(),
         "```tool_call".to_string(),
         "{\"name\":\"<tool name>\",\"arguments\":{...}}".to_string(),
@@ -498,7 +630,7 @@ pub fn parse_tool_calls(
     text: &str,
     known_names: Option<&std::collections::HashSet<String>>,
 ) -> (String, Vec<ParsedToolCall>) {
-    let re = Regex::new(r"```tool_call\s*([\s\S]*?)```").unwrap();
+    let re = tool_call_re();
     let mut calls = Vec::new();
     let mut rest = text.to_string();
     for m in re.find_iter(text) {
@@ -585,7 +717,7 @@ mod tests {
                 { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAA" } }
             ]
         })];
-        let files = collect_file_parts(&msgs);
+        let files = collect_file_parts(&msgs).unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["type"], "file");
         assert_eq!(files[0]["mime"], "image/jpeg");
@@ -664,6 +796,107 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn apply_stop_and_max_tokens_keeps_utf8_boundaries() {
+        let opts = ChatOptions {
+            max_tokens: Some(1),
+            stop: None,
+            response_format: None,
+        };
+        let emoji = apply_stop_and_max_tokens("👋👋", &opts);
+        assert_eq!(emoji.text, "👋");
+        assert_eq!(emoji.truncated_by, Some("length".into()));
+        let mixed = apply_stop_and_max_tokens("a👋", &opts);
+        assert_eq!(mixed.text, "a");
+        let accents = apply_stop_and_max_tokens("ééé", &opts);
+        assert_eq!(accents.text, "éé");
+    }
+
+    #[test]
+    fn char_chunks_do_not_split_codepoints() {
+        let parts = char_chunks("a👋b", 2);
+        assert_eq!(parts.concat(), "a👋b");
+        for part in &parts {
+            assert!(part.is_char_boundary(part.len()));
+        }
+    }
+
+    #[test]
+    fn guess_mime_unknown_is_octet_stream() {
+        assert_eq!(
+            guess_mime("https://example.com/file.bin"),
+            "application/octet-stream"
+        );
+        assert_eq!(guess_mime("https://example.com/a.png"), "image/png");
+    }
+
+    #[test]
+    fn collect_file_parts_rejects_oversize_data_url() {
+        let url = format!("data:image/png;base64,{}", "A".repeat(MAX_FILE_URL_BYTES));
+        let msgs = [json!({
+            "role": "user",
+            "content": [{ "type": "image_url", "image_url": { "url": url } }]
+        })];
+        let err = collect_file_parts(&msgs).unwrap_err();
+        assert_eq!(err.http_status, 400);
+    }
+
+    #[test]
+    fn render_history_keeps_the_tail() {
+        let msgs: Vec<_> = (0..6)
+            .map(|i| json!({ "role": "user", "content": format!("MSG{i}-{}", "x".repeat(40)) }))
+            .collect();
+        let out = render_history_with_budget(&msgs, 120);
+        assert!(out.contains("earlier messages omitted"));
+        assert!(out.contains("MSG5-"));
+        assert!(!out.contains("MSG0-"));
+    }
+
+    #[test]
+    fn stop_array_is_capped_at_four() {
+        let err = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stop": ["a", "b", "c", "d", "e"]
+        }))
+        .unwrap_err();
+        assert!(err.message.contains("at most 4"));
+        let ok = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stop": ["a", "b", "c", "d"]
+        }))
+        .unwrap();
+        assert_eq!(ok.stop.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn n_must_be_one() {
+        let err = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "n": 2
+        }))
+        .unwrap_err();
+        assert!(err.message.contains("n=1"));
+    }
+
+    #[test]
+    fn tool_choice_accepts_openai_function_shape() {
+        let ok = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "get_weather" } }
+        }));
+        assert!(ok.is_ok());
+        let also = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "function", "name": "get_weather" }
+        }));
+        assert!(also.is_ok());
+        let bad = parse_chat_options(&json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "tool", "function": { "name": "get_weather" } }
+        }));
+        assert!(bad.is_err());
     }
 
     #[test]
