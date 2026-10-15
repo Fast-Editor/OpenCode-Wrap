@@ -115,13 +115,21 @@ before starting the wrapper.
 | `WRAP_MODEL` | `muse-spark-1.3-contributor-free` | Backend model |
 | `WRAP_PROVIDER` | `opencode` | Backend provider |
 | `WRAP_AGENT` | `build` | OpenCode agent each per-request session runs under |
-| `WRAP_CWD` | `/tmp` | Existing directory for spawned serve. Native bash tools run here — use an empty sandbox, not your home directory |
+| `WRAP_CWD` | `/tmp` (Unix) / `%TEMP%` (Windows) | Existing directory for spawned serve. Native bash tools run here — use an empty sandbox, not your home directory |
 | `WRAP_OCO_TIMEOUT_MS` | `180000` | Per-backend-request timeout |
 | `WRAP_MAX_BODY_BYTES` | `8388608` | Max chat body. Oversize requests return OpenAI-shaped `413` |
 | `WRAP_ZEN_MODELS_URL` | `https://opencode.ai/zen/v1/models` | Zen model allowlist |
 | `WRAP_API_KEY` | unset | When set, `/v1/*` routes require `Authorization: Bearer <key>` (health stays open) |
 | `WRAP_CORS_ORIGINS` | unset (any) | Comma-separated allowed CORS origins |
 | `WRAP_MAX_IN_FLIGHT` | `8` | Concurrent chat requests before replying `429` |
+
+## Windows
+
+Works with a native `opencode.exe` on `PATH` (official installer, scoop,
+etc.). npm installs expose OpenCode as an `opencode.cmd` shim; the wrapper
+finds that too, but then only the shim is killed on shutdown, so the spawned
+`opencode serve` can outlive the wrapper — prefer the native install, or run
+`opencode serve` yourself and point `OPENCODE_BASE` at it.
 
 ## Tests
 
