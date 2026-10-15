@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
 use crate::config::Config;
@@ -15,6 +15,7 @@ pub struct OcoClient {
     pub config: Config,
     pub http: Client,
     zen_cache: Arc<RwLock<ZenCache>>,
+    zen_fetch: Arc<Mutex<()>>,
 }
 
 struct ZenCache {
@@ -31,15 +32,35 @@ impl OcoClient {
                 at: Instant::now() - Duration::from_secs(7200),
                 ids: HashSet::new(),
             })),
+            zen_fetch: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Attach the HTTP basic-auth credentials every OpenCode 2 `/api/*`
+    /// route requires.
+    pub fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.basic_auth(
+            &self.config.opencode_username,
+            Some(&self.config.opencode_password),
+        )
+    }
+
+    async fn fresh_zen_ids(&self) -> Option<HashSet<String>> {
+        let cache = self.zen_cache.read().await;
+        if cache.at.elapsed() < Duration::from_secs(3600) && !cache.ids.is_empty() {
+            Some(cache.ids.clone())
+        } else {
+            None
         }
     }
 
     pub async fn zen_model_ids(&self) -> HashSet<String> {
-        {
-            let cache = self.zen_cache.read().await;
-            if cache.at.elapsed() < Duration::from_secs(3600) && !cache.ids.is_empty() {
-                return cache.ids.clone();
-            }
+        if let Some(ids) = self.fresh_zen_ids().await {
+            return ids;
+        }
+        let _fetch = self.zen_fetch.lock().await;
+        if let Some(ids) = self.fresh_zen_ids().await {
+            return ids;
         }
         let url = self.config.zen_models_url.clone();
         let res = self
@@ -93,11 +114,12 @@ pub async fn oco(
     body: Option<&Value>,
     timeout_ms: Option<u64>,
 ) -> Result<Value, WrapError> {
+    let parsed_method = method
+        .parse::<reqwest::Method>()
+        .map_err(|_| WrapError::Other(format!("invalid HTTP method \"{method}\"")))?;
     let timeout_ms = timeout_ms.unwrap_or(client.config.oco_timeout_ms);
     let url = format!("{}{}", client.config.opencode_base, path);
-    let mut req = client
-        .http
-        .request(method.parse().unwrap_or(reqwest::Method::GET), &url);
+    let mut req = client.authorize(client.http.request(parsed_method, &url));
     req = req.header("Content-Type", "application/json");
     if let Some(b) = body {
         req = req.json(b);
@@ -112,10 +134,7 @@ pub async fn oco(
                     method, path, timeout_ms,
                 )));
             }
-            if e.is_connect() || e.is_request() {
-                return Err(WrapError::Other(e.to_string()));
-            }
-            return Err(WrapError::Other(e.to_string()));
+            return Err(transport_error(e));
         }
     };
     let status = res.status().as_u16();
@@ -125,7 +144,7 @@ pub async fn oco(
     } else {
         serde_json::from_str(&text).ok()
     };
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(WrapError::Upstream(UpstreamError {
             upstream_status: status,
             upstream_body: text.chars().take(2000).collect(),
@@ -138,15 +157,36 @@ pub fn is_timeout_abort(err: &WrapError) -> bool {
     matches!(err, WrapError::Timeout(_))
 }
 
-pub fn is_transient_connection_error(err: &WrapError) -> bool {
-    if let WrapError::Other(e) = err {
-        let msg = e.to_string();
-        return msg.contains("ECONNREFUSED")
-            || msg.contains("ECONNRESET")
-            || msg.contains("connection")
-            || msg.contains("fetch failed");
+fn transport_error(err: reqwest::Error) -> WrapError {
+    if err.is_connect() || err.is_body() || error_is_incomplete(&err) {
+        WrapError::Other(format!("transient connection: {err}"))
+    } else {
+        WrapError::Other(err.to_string())
+    }
+}
+
+fn error_is_incomplete(err: &reqwest::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let msg = e.to_string().to_ascii_lowercase();
+        if msg.contains("incomplete message") || msg.contains("unexpected eof") {
+            return true;
+        }
+        current = e.source();
     }
     false
+}
+
+pub fn is_transient_connection_error(err: &WrapError) -> bool {
+    matches!(err, WrapError::Other(msg) if msg.starts_with("transient connection:"))
+}
+
+pub fn retry_backoff_ms(err: &WrapError, attempt: u32) -> u64 {
+    if is_rate_limited_upstream(err) {
+        4_000
+    } else {
+        1_500 * u64::from(attempt)
+    }
 }
 
 pub fn is_retryable_upstream(err: &WrapError) -> bool {
@@ -223,11 +263,7 @@ where
                 if !is_retryable_upstream(&err) || attempt == max_attempts {
                     return Err(err);
                 }
-                let delay = if is_rate_limited_upstream(&err) {
-                    4000
-                } else {
-                    1500 * attempt as u64
-                };
+                let delay = retry_backoff_ms(&err, attempt);
                 sleep(Duration::from_millis(delay)).await;
             }
         }
@@ -235,13 +271,10 @@ where
     Err(last_err.unwrap_or(WrapError::ClientAbort(ClientAbortError::default())))
 }
 
-pub async fn zen_model_ids(client: &OcoClient) -> HashSet<String> {
-    client.zen_model_ids().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::error::{ClientAbortError, OcoTimeoutError, UpstreamError, WrapError};
 
     #[test]
@@ -256,6 +289,27 @@ mod tests {
         let a = WrapError::ClientAbort(ClientAbortError::default());
         assert!(!is_retryable_upstream(&a));
         assert_eq!(upstream_http_status(&a), 499);
+    }
+
+    #[test]
+    fn plain_connection_text_is_not_transient() {
+        let broad = WrapError::Other("connection pool closed".into());
+        assert!(!is_transient_connection_error(&broad));
+        let marked = WrapError::Other("transient connection: connection refused".into());
+        assert!(is_transient_connection_error(&marked));
+        assert!(is_retryable_upstream(&marked));
+    }
+
+    #[tokio::test]
+    async fn invalid_method_is_rejected() {
+        let client = OcoClient::new(Config::for_tests());
+        let err = oco(&client, "/api/session", "NOT A METHOD", None, Some(1_000))
+            .await
+            .unwrap_err();
+        match err {
+            WrapError::Other(msg) => assert!(msg.contains("invalid HTTP method")),
+            other => panic!("expected method error, got {other}"),
+        }
     }
 
     #[test]
