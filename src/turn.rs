@@ -79,6 +79,26 @@ fn split_variant(id: &str) -> (String, Option<String>) {
     }
 }
 
+/// Preferred stand-in when the configured default is gone from Zen.
+const FALLBACK_DEFAULT_MODEL: &str = "deepseek-v4.1-flash-free";
+
+/// The configured default when Zen still lists it, otherwise the best free
+/// model Zen currently offers. Zen rotates its catalogue, so a pinned default
+/// eventually disappears and every caller without an explicit model breaks.
+pub fn pick_default_model(configured: &str, ids: &HashSet<String>) -> String {
+    let configured = resolve_model_id(configured);
+    if ids.is_empty() || ids.contains(&configured) {
+        return configured;
+    }
+    let mut free: Vec<&String> = ids.iter().filter(|id| id.ends_with("-free")).collect();
+    free.sort();
+    free.iter()
+        .find(|id| id.as_str() == FALLBACK_DEFAULT_MODEL)
+        .or_else(|| free.first())
+        .map(|id| (*id).clone())
+        .unwrap_or(configured)
+}
+
 pub async fn prepare_turn(client: &OcoClient, body: &Value) -> Result<PreparedTurn, WrapError> {
     let messages = body
         .get("messages")
@@ -86,17 +106,21 @@ pub async fn prepare_turn(client: &OcoClient, body: &Value) -> Result<PreparedTu
         .cloned()
         .unwrap_or_default();
     let chat_opts = parse_chat_options(body).map_err(WrapError::from)?;
+    let ids = client.zen_model_ids().await;
+    let default_model = pick_default_model(&client.config.default_model, &ids);
+    if default_model != client.config.default_model {
+        tracing::warn!(
+            "[wrap] default model \"{}\" is not offered by Zen; using \"{}\"",
+            client.config.default_model,
+            default_model
+        );
+    }
 
     let raw_req = body
         .get("model")
         .and_then(|m| m.as_str())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "{}/{}",
-                client.config.default_provider, client.config.default_model
-            )
-        });
+        .unwrap_or_else(|| format!("{}/{}", client.config.default_provider, default_model));
 
     let explicit = raw_req.contains('/');
     let (req_provider, req_id, variant) = if explicit {
@@ -113,7 +137,6 @@ pub async fn prepare_turn(client: &OcoClient, body: &Value) -> Result<PreparedTu
         )
     };
 
-    let ids = client.zen_model_ids().await;
     let model = if ids.contains(&req_id) {
         model_ref("opencode", &req_id, variant.as_deref())
     } else if explicit && req_provider == "opencode" && !ids.is_empty() {
@@ -145,13 +168,9 @@ pub async fn prepare_turn(client: &OcoClient, body: &Value) -> Result<PreparedTu
             "[wrap] virtual model \"{}\" -> backend {}/{}",
             raw_req,
             client.config.default_provider,
-            client.config.default_model
+            default_model
         );
-        model_ref(
-            &client.config.default_provider,
-            &resolve_model_id(&client.config.default_model),
-            None,
-        )
+        model_ref(&client.config.default_provider, &default_model, None)
     };
 
     let system = messages
@@ -333,12 +352,12 @@ pub async fn list_models(client: &OcoClient) -> Value {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let ids = client.zen_model_ids().await;
     let def_id = format!(
         "{}/{}",
         client.config.default_provider,
-        resolve_model_id(&client.config.default_model)
+        pick_default_model(&client.config.default_model, &ids)
     );
-    let ids = client.zen_model_ids().await;
     if !ids.is_empty() {
         let mut sorted: Vec<_> = ids.iter().cloned().collect();
         sorted.sort();
@@ -1053,6 +1072,37 @@ mod tests {
         OcoClient::new(Config::for_tests())
     }
 
+    fn ids(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_model_kept_when_zen_still_offers_it() {
+        let zen = ids(&["deepseek-v4.1-flash-free", "big-pickle"]);
+        assert_eq!(
+            pick_default_model("deepseek-v4.1-flash-free", &zen),
+            "deepseek-v4.1-flash-free"
+        );
+    }
+
+    #[test]
+    fn default_model_falls_back_when_zen_drops_it() {
+        let zen = ids(&["big-pickle", "glm-5.3-flash-free"]);
+        assert_eq!(
+            pick_default_model("muse-spark-1.3-contributor-free", &zen),
+            "glm-5.3-flash-free"
+        );
+    }
+
+    #[test]
+    fn default_model_unchanged_without_zen_catalogue() {
+        let zen = HashSet::new();
+        assert_eq!(
+            pick_default_model("muse-spark-1.3-contributor-free", &zen),
+            "muse-spark-1.3-contributor-free"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_turn_merges_developer_and_files() {
         let client = test_client();
@@ -1086,7 +1136,7 @@ mod tests {
         assert_eq!(prepared.session_body["model"]["providerID"], "opencode");
         assert_eq!(
             prepared.session_body["model"]["id"],
-            "muse-spark-1.3-contributor-free"
+            "deepseek-v4.1-flash-free"
         );
         assert_eq!(prepared.session_body["agent"], "build");
         assert_eq!(prepared.model_name, "wrap/test-model");
