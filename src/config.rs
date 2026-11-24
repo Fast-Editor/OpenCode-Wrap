@@ -65,7 +65,7 @@ impl Config {
             opencode_password,
             opencode_password_generated,
             default_model: env::var("WRAP_MODEL")
-                .unwrap_or_else(|_| "muse-spark-1.3-contributor-free".into()),
+                .unwrap_or_else(|_| "deepseek-v4.1-flash-free".into()),
             default_provider: env::var("WRAP_PROVIDER").unwrap_or_else(|_| "opencode".into()),
             agent: non_empty_env("WRAP_AGENT").unwrap_or_else(|| "build".into()),
             wrap_cwd,
@@ -94,7 +94,7 @@ impl Config {
             opencode_username: "opencode".into(),
             opencode_password: "test-password".into(),
             opencode_password_generated: true,
-            default_model: "muse-spark-1.3-contributor-free".into(),
+            default_model: "deepseek-v4.1-flash-free".into(),
             default_provider: "opencode".into(),
             agent: "build".into(),
             wrap_cwd: "/tmp".into(),

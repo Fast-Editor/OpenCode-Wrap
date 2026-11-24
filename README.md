@@ -1,7 +1,7 @@
 # opencode-wrap
 
 OpenAI-compatible HTTP API in front of `opencode serve`, using the free model
-`opencode/muse-spark-1.3-contributor-free`. No `OPENCODE_API_KEY` needed —
+`opencode/deepseek-v4.1-flash-free`. No `OPENCODE_API_KEY` needed —
 reuses whatever auth the `opencode` CLI already has.
 
 Targets the **OpenCode 2** server API (`/api/*`, basic auth, session-scoped
@@ -112,7 +112,7 @@ before starting the wrapper.
 | `OPENCODE_PORT` | `4100` | Port for auto-spawned serve |
 | `OPENCODE_SERVER_PASSWORD` | random per start | Basic-auth password for `opencode serve`. Required when `OPENCODE_BASE` points at a server you started yourself |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Basic-auth username for `opencode serve` |
-| `WRAP_MODEL` | `muse-spark-1.3-contributor-free` | Backend model |
+| `WRAP_MODEL` | `deepseek-v4.1-flash-free` | Backend model |
 | `WRAP_PROVIDER` | `opencode` | Backend provider |
 | `WRAP_AGENT` | `build` | OpenCode agent each per-request session runs under |
 | `WRAP_CWD` | `/tmp` (Unix) / `%TEMP%` (Windows) | Existing directory for spawned serve. Native bash tools run here — use an empty sandbox, not your home directory |
@@ -185,7 +185,7 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "opencode/muse-spark-1.3-contributor-free",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "messages": [
       {
         "role": "user",
@@ -201,7 +201,7 @@ Streaming:
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "opencode/muse-spark-1.3-contributor-free",
+    "model": "opencode/deepseek-v4.1-flash-free",
     "stream": true,
     "messages": [
       {
@@ -217,12 +217,12 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"opencode/muse-spark-1.3-contributor-free",
+  -d '{"model":"opencode/deepseek-v4.1-flash-free",
        "messages":[{"role":"user","content":"Explain closures in one paragraph."}]}'
 
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"opencode/muse-spark-1.3-contributor-free",
+  -d '{"model":"opencode/deepseek-v4.1-flash-free",
        "messages":[{"role":"user","content":"Weather in Paris?"}],
        "tools":[{"type":"function","function":{"name":"get_weather",
          "description":"Get weather for a city",
@@ -251,7 +251,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   type comes from the data URI or the `Content-Type` header, falling back to
   the file extension.
 - Opencode-native tools (bash/read/edit) execute server-side automatically.
-- Bare `muse-spark-*-contributor` aliased to `...-contributor-free`.
+- Bare `muse-spark-*-contributor` aliased to `...-contributor-free` (legacy; that
+  family is no longer on Zen).
+- `WRAP_MODEL` naming a model Zen has dropped falls back to another free model
+  instead of failing every request; the substitution is logged at `WARN`.
 - Explicit `opencode/<id>` typos → HTTP 400 with suggestions when Zen list loads.
 - Empty contentless turns retried (fresh session), not served as `stop`.
 - Caller tools use instruction + `tool_call` fence parsing; returned as OpenAI
